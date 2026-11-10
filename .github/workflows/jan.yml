@@ -1,5 +1,4 @@
-
-name: Goethe Booking Telegram Bot
+name: Goethe Booking Checker
 
 on:
   workflow_dispatch:
@@ -9,36 +8,40 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: goethe-booking-check
+  cancel-in-progress: false
+
 jobs:
-  booking-check:
+  check-booking:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install packages
         run: |
-          pip install -r requirements.txt
+          pip install requests playwright
           playwright install --with-deps chromium
 
-      - name: Run Telegram bot
+      - name: Run booking checker
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python jan.py
 
-      - name: Save sent links
+      - name: Save notification history
         run: |
           git config user.name "Goethe Bot"
           git config user.email "bot@users.noreply.github.com"
           git add sent.json
           git diff --cached --quiet || (
-            git commit -m "Save sent booking links"
+            git commit -m "Save booking notification history"
             git push
-          )
+          ) 
