@@ -1,29 +1,23 @@
 import os
 import re
 import json
-import time
 import requests
-from urllib.parse import urlparse, urljoin
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 TOKEN = os.environ["8688494134:AAEFObEX1p4syZwUBPVe-iG5GXkWDj311CA"]
 CHAT_ID = os.environ["8295417969"]
-
-STATE_FILE = "sent.json"
 
 EXAMS = {
     "A1": "https://www.goethe.de/ins/in/en/spr/prf/gzsd1.cfm",
     "B1": "https://www.goethe.de/ins/in/en/spr/prf/gzb1.cfm",
 }
 
-PATTERN = re.compile(
-    r"\b(book|booking|register|registration|reserve)\b",
-    re.I
-)
+STATE_FILE = "sent.json"
 
 def telegram(message):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     response = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        url,
         data={
             "chat_id": CHAT_ID,
             "text": message,
@@ -44,140 +38,169 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
-def find_booking(page, context, level, exam_url):
-    page.goto(
-        exam_url,
-        wait_until="domcontentloaded",
-        timeout=60000
-    )
-    page.wait_for_timeout(5000)
+def find_booking(browser, level, exam_url):
+    context = browser.new_context()
+    page = context.new_page()
 
-    candidates = page.locator("a, button").all()
+    try:
+        response = page.goto(
+            exam_url,
+            wait_until="domcontentloaded",
+            timeout=60000
+        )
 
-    for candidate in candidates:
-        try:
-            if not candidate.is_visible():
-                continue
+        page.wait_for_timeout(5000)
 
-            if not candidate.is_enabled():
-                continue
+        if response and response.status >= 400:
+            print(level, "Exam page HTTP error:", response.status)
+            return None
 
-            label = (
-                candidate.inner_text()
-                or candidate.get_attribute("aria-label")
-                or ""
-            ).strip()
+        # یوازې د Book / Booking تڼۍ ولټوه
+        links = page.locator("a").filter(
+            has_text=re.compile(
+                r"book your exam date|book exam|book now|booking|register for exam",
+                re.I
+            )
+        )
 
-            if not PATTERN.search(label):
-                continue
+        count = links.count()
+        print(level, "Possible booking buttons:", count)
 
-            href = candidate.get_attribute("href") or ""
-
-            if href.startswith(("javascript:", "mailto:")):
-                continue
-
-            print(f"{level}: candidate found: {label}")
-
-            old_url = page.url
-            old_pages = list(context.pages)
+        for i in range(count):
+            button = links.nth(i)
 
             try:
-                candidate.click(timeout=15000)
-            except Exception as e:
-                print("Click failed:", e)
-                continue
+                if not button.is_visible():
+                    continue
 
-            page.wait_for_timeout(6000)
+                old_url = page.url
+                href = button.get_attribute("href") or ""
 
-            new_pages = [
-                p for p in context.pages
-                if p not in old_pages
-            ]
+                print(level, "Clicking booking button...")
 
-            if new_pages:
-                destination = new_pages[-1]
+                destination = page
+
+                # تڼۍ کېکاږه او نوې پاڼه ونیسه
+                try:
+                    with context.expect_page(timeout=10000) as new_page:
+                        button.click(timeout=15000)
+
+                    destination = new_page.value
+
+                except PlaywrightTimeout:
+                    # کېدای شي هماغه ټب کې پاڼه بدله شوې وي
+                    destination = page
+
                 try:
                     destination.wait_for_load_state(
                         "domcontentloaded",
-                        timeout=20000
+                        timeout=30000
                     )
                 except Exception:
                     pass
+
+                destination.wait_for_timeout(4000)
                 final_url = destination.url
-            else:
-                final_url = page.url
 
-            # د هماغې پاڼې URL مه استوه
-            if final_url == old_url or final_url == exam_url:
-                continue
+                # که په هماغه ټب کې نه وي خلاص شوی،
+                # د تڼۍ اصلي href په نوي ټب کې وازمویه
+                if final_url == old_url and href:
+                    from urllib.parse import urljoin
+                    direct_href = urljoin(old_url, href)
 
-            parsed = urlparse(final_url)
+                    if direct_href.startswith("https://"):
+                        fallback = context.new_page()
+                        fallback.goto(
+                            direct_href,
+                            wait_until="domcontentloaded",
+                            timeout=30000
+                        )
+                        fallback.wait_for_timeout(3000)
+                        final_url = fallback.url
+                        destination = fallback
 
-            if parsed.scheme != "https":
-                continue
-
-            # یوازې د Book کلیک وروسته نوی URL
-            # او د ثبت‌نام اړوند مسیر تایید کړه
-            path = (
-                parsed.path + " " + parsed.query
-            ).lower()
-
-            if not any(word in path for word in [
-                "book", "register", "registration",
-                "exam", "appointment", "shop", "checkout"
-            ]):
-                # که نوی URL د بل ډومېن وي، بیا هم یې
-                # یوازې هغه وخت ومنه چې د کلیک له لارې راغلی وي.
-                if parsed.netloc == urlparse(exam_url).netloc:
+                if not final_url.startswith("https://"):
                     continue
 
-            return final_url
+                if final_url == exam_url or final_url == old_url:
+                    continue
 
-        except Exception as e:
-            print("Candidate error:", e)
+                body = destination.locator("body").inner_text().lower()
 
-    return None
+                # د تېروتنې پاڼه مه استوه
+                error_words = [
+                    "internal server error",
+                    "access denied",
+                    "page not found",
+                    "temporarily unavailable"
+                ]
+
+                if any(word in body for word in error_words):
+                    print(level, "Booking page returned an error.")
+                    continue
+
+                # د بکینګ پاڼې د محتوا لومړنی تایید
+                booking_words = [
+                    "booking", "registration", "register",
+                    "exam date", "select date", "available dates",
+                    "appointment", "candidate", "checkout"
+                ]
+
+                url_and_body = final_url.lower() + " " + body
+
+                if any(word in url_and_body for word in booking_words):
+                    return final_url
+
+                print(level, "Destination not verified as booking page.")
+
+            except Exception as error:
+                print(level, "Button error:", error)
+
+        return None
+
+    except Exception as error:
+        print(level, "Page error:", error)
+        return None
+
+    finally:
+        context.close()
 
 def main():
     state = load_state()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
 
-        for level, exam_url in EXAMS.items():
-            try:
-                link = find_booking(
-                    page, context, level, exam_url
-                )
+        try:
+            for level, exam_url in EXAMS.items():
+                print("Checking", level)
+
+                link = find_booking(browser, level, exam_url)
 
                 if not link:
-                    print(level, "No confirmed booking URL.")
+                    print(level, "No verified booking page.")
                     continue
 
                 if link in state["sent"]:
-                    print("Already sent:", link)
+                    print("Already notified:", link)
                     continue
 
                 telegram(
-                    "🚨 Goethe India Booking page link\n\n"
+                    "🚨 Goethe India Booking Page Found!\n\n"
                     f"📘 Level: {level}\n"
                     "🌍 Country: India\n\n"
-                    "👇 د براوزر لپاره لینک:\n"
+                    "👇 د خلاصې شوې بکینګ پاڼې لینک:\n"
                     f"{link}\n\n"
-                    "خپله فورمه خلاصه او ثبت‌نام بشپړ کړه."
+                    "په براوزر کې یې خلاص کړه او خپله ثبت‌نام بشپړه کړه."
                 )
 
                 state["sent"].append(link)
                 save_state(state)
 
-                print("Telegram link sent:", link)
+                print("Booking link sent to Telegram.")
 
-            except Exception as e:
-                print(level, "Error:", str(e))
-
-        browser.close()
+        finally:
+            browser.close()
 
 if __name__ == "__main__":
     main() 
