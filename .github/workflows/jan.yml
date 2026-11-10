@@ -1,7 +1,15 @@
 name: Goethe Booking Checker
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - jan.py
+      - .github/workflows/jan.yml
+
   workflow_dispatch:
+
   schedule:
     - cron: "*/10 * * * *"
 
@@ -30,7 +38,7 @@ jobs:
           pip install requests playwright
           playwright install --with-deps chromium
 
-      - name: Run booking checker
+      - name: Run checker
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -42,6 +50,6 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           git add sent.json
           git diff --cached --quiet || (
-            git commit -m "Save booking notification history"
+            git commit -m "Save booking history"
             git push
           ) 
